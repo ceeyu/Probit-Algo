@@ -1,0 +1,3 @@
+Gset,number of edges,edge value,edge type,best-known value,mean_cut_value,max_cut_value,min_cut_value,std_cut,n_rnd,I0_min,I0_max,ratio of mean/best,ratio of max/best,1 annealing_time [ms],Total time [s],mean_range,stall_prop,l_scale,d_scale,n_scale
+G1,800,unipolar,random,11624,18.6,49,0,25.53037406698147,4.656917354244709,27.048052,43.32672,0.16001376462491398,0.42154163799036476,214.3736328125,2.1842122077941895,4,0.5,0.1,0.1,0.3
+G55,5000,unipolar,random,10299,53.8,105,4,43.90558051091,1.4637052035839557,0.03872596,7.745192,0.5223808136712302,1.0195164579085347,5036.634521484375,29.23436141014099,4,0.5,0.1,0.1,0.3
