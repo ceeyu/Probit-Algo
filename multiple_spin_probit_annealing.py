@@ -24,6 +24,8 @@ def parse_arguments():
                        help="Annealing schedule type (default: exponential)")
     parser.add_argument('--probit_mode', type=str, default='synchronous', choices=['synchronous', 'asynchronous'],
                        help="Probit update mode: synchronous (parallel hardware) or asynchronous (MCS) (default: synchronous)")
+    parser.add_argument('--epsilon', type=float, default=0.1,
+                       help="RPA ratio: fraction of spins allowed to update per timestep (synchronous mode) (default: 0.1)")
     return parser.parse_args()
 
 def read_file_MAXCUT(file_path):
@@ -80,14 +82,18 @@ def calculate_cut(m_vector, G_matrix):
     cut_val = np.sum(G_matrix[upper_triangle] * (1 - np.outer(spin, spin)[upper_triangle]))
     return int(cut_val / 2)  # 除以 2 是因為 (1 - spin[i]*spin[j]) 對不同號給出 2
 
-def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
+def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False, epsilon=0.1):
     """
-    Probit 類比退火法（同步平行更新 - 硬體 Crossbar 方式）
+    Probit 類比退火法（RPA 策略 - Ratio-Controlled Parallel Annealing - Amorphica 論文）
     
-    每個 timestep 同時更新所有 spin：
-    1. Crossbar 平行 MVM: I = J × m
-    2. TRNG 平行產生所有雜訊
-    3. Sense Amplifier 平行決策: m_new = sgn(I + noise)
+    每個 timestep：
+    1. Crossbar 平行 MVM: I = J × m（一次計算所有 I_vector）
+    2. 平行 TRNG: 產生 noise_vector
+    3. 平行決策: m_proposed = sgn(I + noise)（計算所有提議的新狀態）
+    4. RPA 遮罩: 只允許 N * epsilon 個 spin 實際更新（Policy-Dependent Masker）
+    
+    參數:
+        epsilon: RPA 比例，控制每個 timestep 更新的 spin 比例 (default: 0.1 = 10%)
     """
     N = J_matrix.shape[0]
     
@@ -108,10 +114,9 @@ def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, sc
         current_energy = calculate_energy(m_vector, J_matrix)
         energy_history.append(current_energy)
     
-    
-    # 3. 同步 Probit 迴圈（真平行）
+    # 3. RPA 同步迴圈（真平行 + 部分更新）
     for t in range(timesteps):
-        sigma = annealing_schedule[t] #退火參數(每個timestep的sigma)
+        sigma = annealing_schedule[t]
         
         # 步驟 1: 真平行 MVM (Crossbar 一次算出所有 I)
         I_vector = np.dot(J_matrix, m_vector)
@@ -121,23 +126,34 @@ def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, sc
         common_noise = np.random.normal(0.0, sigma)
         noise_vector = np.full(N, common_noise)
         
-        # === 調試信息（前5步）===
-        if t < 5 and record_energy:
-            print(f"\n[Debug] Step {t}:")
-            print(f"  sigma = {sigma:.4f}, common_noise = {common_noise:.4f}")
-            print(f"  I_vector 範圍: [{np.min(I_vector):.2f}, {np.max(I_vector):.2f}]")
-            print(f"  I + noise 範圍: [{np.min(I_vector + noise_vector):.2f}, {np.max(I_vector + noise_vector):.2f}]")
-            print(f"  m_vector 統計: +1有{np.sum(m_vector == 1)}個, -1有{np.sum(m_vector == -1)}個")
-        
-        # 步驟 3: 真平行決策 (Sense Amplifier 一次更新所有 m)
-        m_vector_new = np.sign(I_vector + noise_vector)
-        
+        # 步驟 3: 真平行決策 (計算「提議」的新狀態)
+        m_vector_proposed = np.sign(I_vector + noise_vector)
         
         # 處理 sgn(0) 的情況：保持原值
-        zero_mask = (m_vector_new == 0)
-        m_vector_new[zero_mask] = m_vector[zero_mask]
+        zero_mask = (m_vector_proposed == 0)
+        m_vector_proposed[zero_mask] = m_vector[zero_mask]
+
+        # === 步驟 4: RPA 遮罩 (Amorphica 論文的核心 - Policy-Dependent Masker) ===
+        # 找出所有「想要翻轉」的 spin (即 m_proposed != m_vector)
+        flippable_indices = np.where(m_vector_proposed != m_vector)[0]
+        num_flippable = len(flippable_indices)
         
-        # 步驟 4: 同步更新
+        # 計算我們「允許」翻轉多少個
+        num_allowed_flips = int(N * epsilon)
+        
+        # 建立一個全為「保持原值」的新向量
+        m_vector_new = m_vector.copy()
+
+        if num_flippable > 0:
+            if num_flippable <= num_allowed_flips:
+                # 想翻轉的 spin 數量 <= 允許數量，全部翻轉
+                m_vector_new[flippable_indices] = m_vector_proposed[flippable_indices]
+            else:
+                # 想翻轉的 spin 數量 > 允許數量，隨機挑選 num_allowed_flips 個來翻轉
+                indices_to_flip = np.random.choice(flippable_indices, size=num_allowed_flips, replace=False)
+                m_vector_new[indices_to_flip] = m_vector_proposed[indices_to_flip]
+        
+        # 步驟 5: 更新
         m_vector = m_vector_new
         
         # 記錄能量
@@ -296,7 +312,9 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
     print(f"Probit 模式: {args.probit_mode}")
     print(f"Probit 參數: sigma_start={args.sigma_start}, sigma_end={args.sigma_end}")
     if args.probit_mode == 'synchronous':
-        print(f"  → 同步更新：每個 timestep 平行更新所有 {N} 個 spin (硬體 Crossbar 模式)")
+        print(f"  → RPA 同步模式（Ratio-Controlled Parallel Annealing - Amorphica 論文）")
+        print(f"  → 平行計算：每個 timestep 平行計算所有 {N} 個 I_vector (硬體 Crossbar)")
+        print(f"  → 部分更新：每個 timestep 最多更新 {int(N * args.epsilon)} 個 spin (epsilon={args.epsilon})")
     else:
         print(f"  → 非同步更新：每個 timestep 更新 {N} 個 spin (MCS)")
     print(f"Traditional SA 參數: T_start={args.T_start}, T_end={args.T_end}")
@@ -327,7 +345,7 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         if args.probit_mode == 'synchronous':
             m_probit, energy_hist = probit_annealing_synchronous(
                 J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
-                args.schedule, record_energy=record_last
+                args.schedule, record_energy=record_last, epsilon=args.epsilon
             )
         else:  # asynchronous
             m_probit, energy_hist = probit_annealing(
@@ -505,10 +523,12 @@ def save_results_and_plots(args, results, file_base, best_known):
         
         # 能量演化（最後一次試驗）
         if results['probit_energy_history'] is not None:
+            # 確保兩個列表長度相同（Probit 多記錄了初始能量）
+            min_len = min(len(results['probit_energy_history']), len(results['sa_energy_history']))
             df_evolution = pd.DataFrame({
-                'Timestep': range(len(results['probit_energy_history'])),
-                'Probit_Energy': results['probit_energy_history'],
-                'SA_Energy': results['sa_energy_history']
+                'Timestep': range(min_len),
+                'Probit_Energy': results['probit_energy_history'][:min_len],
+                'SA_Energy': results['sa_energy_history'][:min_len]
             })
             df_evolution.to_excel(writer, sheet_name='Energy_Evolution', index=False)
     
