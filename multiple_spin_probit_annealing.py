@@ -135,8 +135,8 @@ def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, sc
 
         # === 步驟 4: RPA 遮罩 (Amorphica 論文的核心 - Policy-Dependent Masker) ===
         # 找出所有「想要翻轉」的 spin (即 m_proposed != m_vector)
-        flippable_indices = np.where(m_vector_proposed != m_vector)[0]
-        num_flippable = len(flippable_indices)
+        flippable_indices = np.where(m_vector_proposed != m_vector)[0] # 想要翻轉的spin的index
+        num_flippable = len(flippable_indices) # 想要翻轉的spin的數量
         
         # 計算我們「允許」翻轉多少個
         num_allowed_flips = int(N * epsilon)
