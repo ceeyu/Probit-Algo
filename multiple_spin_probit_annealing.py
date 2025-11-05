@@ -24,8 +24,6 @@ def parse_arguments():
                        help="Annealing schedule type (default: exponential)")
     parser.add_argument('--probit_mode', type=str, default='synchronous', choices=['synchronous', 'asynchronous'],
                        help="Probit update mode: synchronous (parallel hardware) or asynchronous (MCS) (default: synchronous)")
-    parser.add_argument('--noise_samples', type=int, default=5,
-                       help="Number of noise samples for time-multiplexed decision (synchronous mode) (default: 5)")
     return parser.parse_args()
 
 def read_file_MAXCUT(file_path):
@@ -82,19 +80,14 @@ def calculate_cut(m_vector, G_matrix):
     cut_val = np.sum(G_matrix[upper_triangle] * (1 - np.outer(spin, spin)[upper_triangle]))
     return int(cut_val / 2)  # 除以 2 是因為 (1 - spin[i]*spin[j]) 對不同號給出 2
 
-def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False, noise_samples=5):
+def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
     """
     Probit 類比退火法（同步平行更新 - 硬體 Crossbar 方式）
     
     每個 timestep 同時更新所有 spin：
-    1. Crossbar 平行 MVM: I = J × m（一次計算）
-    2. 多次採樣決策（Time-Multiplexed）：
-       - 用不同的全局雜訊多次評估
-       - 根據多數決或平均來決定每個 spin 的方向
-    3. Sense Amplifier 平行決策
-    
-    參數:
-        noise_samples: 每個 timestep 用幾個不同雜訊採樣來決策
+    1. Crossbar 平行 MVM: I = J × m
+    2. TRNG 平行產生所有雜訊
+    3. Sense Amplifier 平行決策: m_new = sgn(I + noise)
     """
     N = J_matrix.shape[0]
     
@@ -116,36 +109,29 @@ def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, sc
         energy_history.append(current_energy)
     
     
-    # 3. 同步 Probit 迴圈（真平行 + 時間多工）
+    # 3. 同步 Probit 迴圈（真平行）
     for t in range(timesteps):
         sigma = annealing_schedule[t] #退火參數(每個timestep的sigma)
         
         # 步驟 1: 真平行 MVM (Crossbar 一次算出所有 I)
         I_vector = np.dot(J_matrix, m_vector)
         
-        # 步驟 2: 時間多工決策（用多個雜訊樣本來決策）
-        # 硬體實現：在同一個 timestep 內，TRNG 產生多個不同的全局雜訊
-        # 每個 Sense Amplifier 統計多次決策結果（多數決或計數器）
-        decision_sum = np.zeros(N)  # 累積決策
-        
-        for sample in range(noise_samples):
-            # 產生全局雜訊（RRAM 特性：所有 spin 相同）
-            common_noise = np.random.normal(0.0, sigma)
-            
-            # 每個 SA 決策
-            decision = np.sign(I_vector + common_noise)
-            decision_sum += decision
-        
-        # 步驟 3: 根據多數決更新（多個採樣的平均方向）
-        m_vector_new = np.sign(decision_sum)
+        # 步驟 2: 真平行 TRNG (一次產生所有雜訊)
+        # noise_vector = np.random.normal(0.0, sigma, size=N)
+        common_noise = np.random.normal(0.0, sigma)
+        noise_vector = np.full(N, common_noise)
         
         # === 調試信息（前5步）===
         if t < 5 and record_energy:
             print(f"\n[Debug] Step {t}:")
-            print(f"  sigma = {sigma:.4f}")
+            print(f"  sigma = {sigma:.4f}, common_noise = {common_noise:.4f}")
             print(f"  I_vector 範圍: [{np.min(I_vector):.2f}, {np.max(I_vector):.2f}]")
-            print(f"  經過 {noise_samples} 次採樣後的決策")
+            print(f"  I + noise 範圍: [{np.min(I_vector + noise_vector):.2f}, {np.max(I_vector + noise_vector):.2f}]")
             print(f"  m_vector 統計: +1有{np.sum(m_vector == 1)}個, -1有{np.sum(m_vector == -1)}個")
+        
+        # 步驟 3: 真平行決策 (Sense Amplifier 一次更新所有 m)
+        m_vector_new = np.sign(I_vector + noise_vector)
+        
         
         # 處理 sgn(0) 的情況：保持原值
         zero_mask = (m_vector_new == 0)
@@ -311,7 +297,6 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
     print(f"Probit 參數: sigma_start={args.sigma_start}, sigma_end={args.sigma_end}")
     if args.probit_mode == 'synchronous':
         print(f"  → 同步更新：每個 timestep 平行更新所有 {N} 個 spin (硬體 Crossbar 模式)")
-        print(f"  → 時間多工：每個 timestep 使用 {args.noise_samples} 個雜訊採樣（多數決）")
     else:
         print(f"  → 非同步更新：每個 timestep 更新 {N} 個 spin (MCS)")
     print(f"Traditional SA 參數: T_start={args.T_start}, T_end={args.T_end}")
@@ -342,7 +327,7 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         if args.probit_mode == 'synchronous':
             m_probit, energy_hist = probit_annealing_synchronous(
                 J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
-                args.schedule, record_energy=record_last, noise_samples=args.noise_samples
+                args.schedule, record_energy=record_last
             )
         else:  # asynchronous
             m_probit, energy_hist = probit_annealing(
@@ -520,12 +505,10 @@ def save_results_and_plots(args, results, file_base, best_known):
         
         # 能量演化（最後一次試驗）
         if results['probit_energy_history'] is not None:
-            # 確保兩個列表長度相同（Probit 可能多記錄了初始能量）
-            min_len = min(len(results['probit_energy_history']), len(results['sa_energy_history']))
             df_evolution = pd.DataFrame({
-                'Timestep': range(min_len),
-                'Probit_Energy': results['probit_energy_history'][:min_len],
-                'SA_Energy': results['sa_energy_history'][:min_len]
+                'Timestep': range(len(results['probit_energy_history'])),
+                'Probit_Energy': results['probit_energy_history'],
+                'SA_Energy': results['sa_energy_history']
             })
             df_evolution.to_excel(writer, sheet_name='Energy_Evolution', index=False)
     
