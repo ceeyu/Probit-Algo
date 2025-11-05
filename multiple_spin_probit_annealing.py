@@ -22,6 +22,10 @@ def parse_arguments():
     parser.add_argument('--T_end', type=float, default=0.01, help="Ending temperature for Traditional SA (default: 0.01)")
     parser.add_argument('--schedule', type=str, default='exponential', choices=['exponential', 'linear'], 
                        help="Annealing schedule type (default: exponential)")
+    parser.add_argument('--probit_mode', type=str, default='synchronous', choices=['synchronous', 'asynchronous'],
+                       help="Probit update mode: synchronous (parallel hardware) or asynchronous (MCS) (default: synchronous)")
+    parser.add_argument('--noise_samples', type=int, default=5,
+                       help="Number of noise samples for time-multiplexed decision (synchronous mode) (default: 5)")
     return parser.parse_args()
 
 def read_file_MAXCUT(file_path):
@@ -60,9 +64,9 @@ def calculate_energy(m_vector, J_matrix):
     """
     N = J_matrix.shape[0]
     spin_vector = np.reshape(m_vector, (N, 1))
-    h_vector = np.reshape(np.diag(J_matrix), (N, 1))
-    h_energy = np.sum(h_vector * spin_vector)
-    J_energy = np.sum((np.dot(J_matrix, spin_vector) - h_vector) * spin_vector) / 2
+    h_vector = np.reshape(np.diag(J_matrix), (N, 1)) # 對角線元素
+    h_energy = np.sum(h_vector * spin_vector) # 對角線元素的能量
+    J_energy = np.sum((np.dot(J_matrix, spin_vector) - h_vector) * spin_vector) / 2 # 非對角線元素
     return -(J_energy + h_energy)
 
 def calculate_cut(m_vector, G_matrix):
@@ -73,12 +77,98 @@ def calculate_cut(m_vector, G_matrix):
     N = len(m_vector)
     spin = np.reshape(m_vector, (N,))
     upper_triangle = np.triu_indices(N, k=1)
+    # 計算 cut 值：對於上三角的每條邊，如果兩端 spin 不同則計入
+    # (1 - spin[i]*spin[j]) 當不同號時 = (1-(-1)) = 2，相同號時 = (1-1) = 0
     cut_val = np.sum(G_matrix[upper_triangle] * (1 - np.outer(spin, spin)[upper_triangle]))
-    return int(cut_val / 2)
+    return int(cut_val / 2)  # 除以 2 是因為 (1 - spin[i]*spin[j]) 對不同號給出 2
+
+def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False, noise_samples=5):
+    """
+    Probit 類比退火法（同步平行更新 - 硬體 Crossbar 方式）
+    
+    每個 timestep 同時更新所有 spin：
+    1. Crossbar 平行 MVM: I = J × m（一次計算）
+    2. 多次採樣決策（Time-Multiplexed）：
+       - 用不同的全局雜訊多次評估
+       - 根據多數決或平均來決定每個 spin 的方向
+    3. Sense Amplifier 平行決策
+    
+    參數:
+        noise_samples: 每個 timestep 用幾個不同雜訊採樣來決策
+    """
+    N = J_matrix.shape[0]
+    
+    # 1. 初始化
+    m_vector = np.random.choice([-1, 1], size=N).astype(np.float64)
+    
+    # 2. 定義退火排程
+    if schedule == 'exponential':
+        alpha = (sigma_end / sigma_start) ** (1.0 / timesteps)
+        annealing_schedule = sigma_start * (alpha ** np.arange(timesteps))
+    else: 
+        annealing_schedule = np.linspace(sigma_start, sigma_end, timesteps)
+    
+    energy_history = []
+    
+    # 記錄初始能量
+    if record_energy:
+        current_energy = calculate_energy(m_vector, J_matrix)
+        energy_history.append(current_energy)
+    
+    
+    # 3. 同步 Probit 迴圈（真平行 + 時間多工）
+    for t in range(timesteps):
+        sigma = annealing_schedule[t] #退火參數(每個timestep的sigma)
+        
+        # 步驟 1: 真平行 MVM (Crossbar 一次算出所有 I)
+        I_vector = np.dot(J_matrix, m_vector)
+        
+        # 步驟 2: 時間多工決策（用多個雜訊樣本來決策）
+        # 硬體實現：在同一個 timestep 內，TRNG 產生多個不同的全局雜訊
+        # 每個 Sense Amplifier 統計多次決策結果（多數決或計數器）
+        decision_sum = np.zeros(N)  # 累積決策
+        
+        for sample in range(noise_samples):
+            # 產生全局雜訊（RRAM 特性：所有 spin 相同）
+            common_noise = np.random.normal(0.0, sigma)
+            
+            # 每個 SA 決策
+            decision = np.sign(I_vector + common_noise)
+            decision_sum += decision
+        
+        # 步驟 3: 根據多數決更新（多個採樣的平均方向）
+        m_vector_new = np.sign(decision_sum)
+        
+        # === 調試信息（前5步）===
+        if t < 5 and record_energy:
+            print(f"\n[Debug] Step {t}:")
+            print(f"  sigma = {sigma:.4f}")
+            print(f"  I_vector 範圍: [{np.min(I_vector):.2f}, {np.max(I_vector):.2f}]")
+            print(f"  經過 {noise_samples} 次採樣後的決策")
+            print(f"  m_vector 統計: +1有{np.sum(m_vector == 1)}個, -1有{np.sum(m_vector == -1)}個")
+        
+        # 處理 sgn(0) 的情況：保持原值
+        zero_mask = (m_vector_new == 0)
+        m_vector_new[zero_mask] = m_vector[zero_mask]
+        
+        # 步驟 4: 同步更新
+        m_vector = m_vector_new
+        
+        # 記錄能量
+        if record_energy:
+            current_energy = calculate_energy(m_vector, J_matrix)
+            energy_history.append(current_energy)
+    
+    if record_energy:
+        return m_vector, energy_history
+    else:
+        return m_vector, None
 
 def probit_annealing(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
     """
-    Probit 類比退火法（非同步更新）
+    Probit 類比退火法（非同步更新 - Monte Carlo Sweep）
+    
+    每個 timestep 執行 N 次隨機單一 spin 更新
     """
     N = J_matrix.shape[0]
     
@@ -217,8 +307,13 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
     print(f"試驗次數: {args.trial}")
     print(f"退火步數: {args.timesteps}")
     print(f"退火排程: {args.schedule}")
+    print(f"Probit 模式: {args.probit_mode}")
     print(f"Probit 參數: sigma_start={args.sigma_start}, sigma_end={args.sigma_end}")
-    print(f"  → 每個 timestep 更新 {N} 個 spin (MCS)")
+    if args.probit_mode == 'synchronous':
+        print(f"  → 同步更新：每個 timestep 平行更新所有 {N} 個 spin (硬體 Crossbar 模式)")
+        print(f"  → 時間多工：每個 timestep 使用 {args.noise_samples} 個雜訊採樣（多數決）")
+    else:
+        print(f"  → 非同步更新：每個 timestep 更新 {N} 個 spin (MCS)")
     print(f"Traditional SA 參數: T_start={args.T_start}, T_end={args.T_end}")
     print(f"  → 每個 timestep 更新 1 個 spin")
     print("="*80 + "\n")
@@ -244,10 +339,16 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         record_last = (trial == args.trial - 1)
         
         t_start = time.perf_counter()
-        m_probit, energy_hist = probit_annealing(
-            J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
-            args.schedule, record_energy=record_last
-        )
+        if args.probit_mode == 'synchronous':
+            m_probit, energy_hist = probit_annealing_synchronous(
+                J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
+                args.schedule, record_energy=record_last, noise_samples=args.noise_samples
+            )
+        else:  # asynchronous
+            m_probit, energy_hist = probit_annealing(
+                J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
+                args.schedule, record_energy=record_last
+            )
         t_end = time.perf_counter()
         probit_time = (t_end - t_start) * 1000  # ms
         
@@ -325,8 +426,10 @@ def save_results_and_plots(args, results, file_base, best_known):
     output_dir = './multiple_spin_probit_comparison_results'
     os.makedirs(output_dir, exist_ok=True)
     
+    mode_suffix = 'sync' if args.probit_mode == 'synchronous' else 'async'
+    
     # === 1. 儲存統計結果到 CSV ===
-    csv_filename = f'{output_dir}/comparison_{file_base}_trial{args.trial}_steps{args.timesteps}_{timestamp}.csv'
+    csv_filename = f'{output_dir}/comparison_{file_base}_{mode_suffix}_trial{args.trial}_steps{args.timesteps}_{timestamp}.csv'
     
     summary_data = {
         'Algorithm': ['Probit', 'Traditional SA'],
@@ -351,7 +454,8 @@ def save_results_and_plots(args, results, file_base, best_known):
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
-    plt.hist(results['probit_energies'], bins=20, alpha=0.7, label='Probit', color='blue', edgecolor='black')
+    probit_label = f'Probit ({args.probit_mode})'
+    plt.hist(results['probit_energies'], bins=20, alpha=0.7, label=probit_label, color='blue', edgecolor='black')
     plt.hist(results['sa_energies'], bins=20, alpha=0.7, label='Traditional SA', color='red', edgecolor='black')
     plt.xlabel('Energy')
     plt.ylabel('Frequency')
@@ -360,7 +464,7 @@ def save_results_and_plots(args, results, file_base, best_known):
     plt.grid(True, alpha=0.3)
     
     plt.subplot(1, 2, 2)
-    plt.hist(results['probit_cuts'], bins=20, alpha=0.7, label='Probit', color='blue', edgecolor='black')
+    plt.hist(results['probit_cuts'], bins=20, alpha=0.7, label=probit_label, color='blue', edgecolor='black')
     plt.hist(results['sa_cuts'], bins=20, alpha=0.7, label='Traditional SA', color='red', edgecolor='black')
     plt.axvline(best_known, color='green', linestyle='--', linewidth=2, label=f'Best Known ({best_known})')
     plt.xlabel('Cut Value')
@@ -370,7 +474,7 @@ def save_results_and_plots(args, results, file_base, best_known):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    hist_filename = f'{output_dir}/histogram_{file_base}_trial{args.trial}_{timestamp}.png'
+    hist_filename = f'{output_dir}/histogram_{file_base}_{mode_suffix}_trial{args.trial}_{timestamp}.png'
     plt.savefig(hist_filename, dpi=150)
     plt.close()
     print(f"能量分佈圖已儲存: {hist_filename}")
@@ -379,7 +483,8 @@ def save_results_and_plots(args, results, file_base, best_known):
     if results['probit_energy_history'] is not None and results['sa_energy_history'] is not None:
         plt.figure(figsize=(12, 6))
         
-        plt.plot(results['probit_energy_history'], label='Probit Annealing', color='blue', linewidth=1.5, alpha=0.8)
+        probit_label = f'Probit ({args.probit_mode})'
+        plt.plot(results['probit_energy_history'], label=probit_label, color='blue', linewidth=1.5, alpha=0.8)
         plt.plot(results['sa_energy_history'], label='Traditional SA', color='red', linewidth=1.5, alpha=0.8)
         
         plt.xlabel('Timesteps')
@@ -389,13 +494,13 @@ def save_results_and_plots(args, results, file_base, best_known):
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         
-        evolution_filename = f'{output_dir}/energy_evolution_{file_base}_steps{args.timesteps}_{timestamp}.png'
+        evolution_filename = f'{output_dir}/energy_evolution_{file_base}_{mode_suffix}_steps{args.timesteps}_{timestamp}.png'
         plt.savefig(evolution_filename, dpi=150)
         plt.close()
         print(f"能量演化曲線已儲存: {evolution_filename}")
     
     # === 4. 儲存詳細結果到 Excel ===
-    excel_filename = f'{output_dir}/detailed_results_{file_base}_trial{args.trial}_{timestamp}.xlsx'
+    excel_filename = f'{output_dir}/detailed_results_{file_base}_{mode_suffix}_trial{args.trial}_{timestamp}.xlsx'
     
     with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
         # 統計摘要
@@ -415,10 +520,12 @@ def save_results_and_plots(args, results, file_base, best_known):
         
         # 能量演化（最後一次試驗）
         if results['probit_energy_history'] is not None:
+            # 確保兩個列表長度相同（Probit 可能多記錄了初始能量）
+            min_len = min(len(results['probit_energy_history']), len(results['sa_energy_history']))
             df_evolution = pd.DataFrame({
-                'Timestep': range(len(results['probit_energy_history'])),
-                'Probit_Energy': results['probit_energy_history'],
-                'SA_Energy': results['sa_energy_history']
+                'Timestep': range(min_len),
+                'Probit_Energy': results['probit_energy_history'][:min_len],
+                'SA_Energy': results['sa_energy_history'][:min_len]
             })
             df_evolution.to_excel(writer, sheet_name='Energy_Evolution', index=False)
     

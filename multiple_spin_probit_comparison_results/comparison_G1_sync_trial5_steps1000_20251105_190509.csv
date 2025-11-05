@@ -1,0 +1,3 @@
+Algorithm,Mean Energy,Std Energy,Min Energy,Max Energy,Mean Cut,Std Cut,Min Cut,Max Cut,Mean Time (ms),Mean Accuracy (%),Max Accuracy (%)
+Probit,19176.0,0.0,19176.0,19176.0,0.0,0.0,0,0,1056.3717800192535,0.0,0.0
+Traditional SA,-2376.8,104.73280288429217,-2532.0,-2286.0,10776.4,52.36640144214609,10731,10854,5.052180029451847,92.70818995182381,93.37577426015142
