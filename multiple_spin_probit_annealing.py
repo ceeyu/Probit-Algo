@@ -166,6 +166,84 @@ def probit_annealing_synchronous(J_matrix, timesteps, sigma_start, sigma_end, sc
     else:
         return m_vector, None
 
+def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False, epsilon=0.1):
+    """
+    Probit 類比退火法（RPA 策略 - Ratio-Controlled Parallel Annealing - Amorphica 論文）
+    
+    每個 timestep：
+    1. Crossbar 平行 MVM: I = J × m（一次計算所有 I_vector）
+    2. 平行 TRNG: 產生 noise_vector
+    3. 平行決策: m_proposed = sgn(I + noise)（計算所有提議的新狀態）
+    4. RPA 遮罩: 只允許 N * epsilon 個 spin 實際更新（Policy-Dependent Masker）
+    
+    參數:
+        epsilon: RPA 比例，控制每個 timestep 更新的 spin 比例 (default: 0.1 = 10%)
+    """
+    N = J_matrix.shape[0]
+    
+    # 1. 初始化
+    m_vector = np.random.choice([-1, 1], size=N).astype(np.float64)
+    
+    # 2. 定義退火排程
+    if schedule == 'exponential': #目前的溫度
+        alpha = (sigma_end / sigma_start) ** (1.0 / timesteps)
+        annealing_schedule = sigma_start * (alpha ** np.arange(timesteps))
+    else: 
+        annealing_schedule = np.linspace(sigma_start, sigma_end, timesteps)
+    
+    energy_history = []
+    
+    # 記錄初始能量
+    if record_energy:
+        current_energy = calculate_energy(m_vector, J_matrix)
+        energy_history.append(current_energy)
+    
+    # 3. RPA 同步迴圈（真平行 + 部分更新）
+    for t in range(timesteps):
+        sigma = annealing_schedule[t]
+        
+        # 步驟 1: 真平行 MVM (Crossbar 一次算出所有 I)
+        I_vector = np.dot(J_matrix, m_vector)
+        
+        # 步驟 2: 真平行 TRNG (一次產生所有雜訊)
+        # noise_vector = np.random.normal(0.0, sigma, size=N)
+        common_noise = np.random.normal(0.0, sigma)
+        noise_vector = np.full(N, common_noise) #先假設所有的隨機數都一樣
+        
+        # 步驟 3: 真平行決策 (計算「提議」的新狀態)
+        m_vector_proposed = np.sign(I_vector + noise_vector)# 經過sense amplifier後的結果
+        
+        # 處理 sgn(0) 的情況：保持原值
+        zero_mask = (m_vector_proposed == 0)
+        m_vector_proposed[zero_mask] = m_vector[zero_mask]
+
+        # === 步驟 4: RPA 機率遮罩 (節省記憶體的實現方式) ===
+        # 硬體實現對應：
+        #   - LFSR_1...LFSR_n: 每個 spin 產生一個 uniform [0,1) 隨機數
+        #   - 比較器: 檢查 LFSR_i 是否 < V_rpa (epsilon)
+        #   - 邏輯: LFSR_i < epsilon → 允許更新 spin_i (更新率 = epsilon)
+        #          LFSR_i > epsilon → 不允許更新 spin_i
+        #   - 註：epsilon = 0.1 → 10% 更新率，期望更新 N*0.1 個 spin
+        
+        update_probability = np.random.rand(N)  # LFSR: 為每個 spin 生成 [0,1) 的隨機機率
+        update_mask = update_probability < epsilon  # 比較器: 機率 < epsilon 的 spin 才被允許更新
+        
+        # 最終決策邏輯閘：只更新被允許的 spin，其餘保持原值
+        m_vector_new = np.where(update_mask, m_vector_proposed, m_vector)
+        
+        # 步驟 5: 更新
+        m_vector = m_vector_new
+        
+        # 記錄能量
+        if record_energy:
+            current_energy = calculate_energy(m_vector, J_matrix)
+            energy_history.append(current_energy)
+    
+    if record_energy:
+        return m_vector, energy_history
+    else:
+        return m_vector, None
+
 def probit_annealing(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
     """
     Probit 類比退火法（非同步更新 - Monte Carlo Sweep）
@@ -343,12 +421,12 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         
         t_start = time.perf_counter()
         if args.probit_mode == 'synchronous':
-            m_probit, energy_hist = probit_annealing_synchronous(
+            m_probit, energy_hist = probit_fitting_hardware_synchronous( #要使用的演算法，可以更改
                 J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
                 args.schedule, record_energy=record_last, epsilon=args.epsilon
             )
         else:  # asynchronous
-            m_probit, energy_hist = probit_annealing(
+            m_probit, energy_hist = probit_annealing( # 使用 Monte Carlo
                 J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
                 args.schedule, record_energy=record_last
             )
