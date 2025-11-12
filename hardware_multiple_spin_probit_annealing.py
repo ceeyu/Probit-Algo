@@ -55,6 +55,22 @@ def get_graph_MAXCUT(vertex, lines):
     G_matrix = G_matrix + G_matrix.T
     return G_matrix
 
+def quantize_xbar_from_G(G_matrix):
+    """
+    將 G_matrix ∈ {-1, 0, +1} 映射為硬體 Xbar 權重 Jij ∈ {0, 0.5, 1}
+    規則（符合硬體儲存限制）:
+      - G_ij = -1 → J_ij = 0.0
+      - G_ij =  0 → J_ij = 0.5
+      - G_ij = +1 → J_ij = 1.0
+    對角線一律設為 0（不使用自耦合）。
+    """
+    J_xbar = np.zeros_like(G_matrix, dtype=np.float64)
+    J_xbar[G_matrix < 0] = 0.0   # G = -1 → J = 0
+    J_xbar[G_matrix == 0] = 0.5  # G =  0 → J = 0.5
+    J_xbar[G_matrix > 0] = 1.0   # G = +1 → J = 1
+    np.fill_diagonal(J_xbar, 0.0)
+    return J_xbar
+
 def calculate_energy(m_vector, J_matrix):
     """
     與 gpu_MAXCUT_var0708.py 一致的能量計算方式：
@@ -244,6 +260,94 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     else:
         return m_vector, None
 
+def probit_binary_spin_synchronous(J_mvm, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False, epsilon=0.1, J_eval=None):
+    """
+    Binary Spin 版本的 Probit RPA（spin ∈ {0, 1} 而非 {-1, +1}）
+    參考 probit_fitting_hardware_synchronous 的硬體實現邏輯
+    
+    每個 timestep：
+    1. Crossbar 平行 MVM: I = J × b（一次計算所有 I_vector）
+    2. 平行 TRNG: 產生共同噪聲 (common_noise)
+    3. 平行決策: b_proposed = (I + noise > 0)（計算所有提議的新狀態）
+    4. RPA 遮罩: 用機率 epsilon 決定每個 spin 是否允許更新（Policy-Dependent Masker）
+    
+    轉換關係：
+    - Binary spin: b ∈ {0, 1}（硬體內部）
+    - Ising spin: s ∈ {-1, +1}（評估輸出）
+    - 轉換公式: s = 2b - 1 或 b = (s + 1) / 2
+    
+    參數:
+        J_mvm: 硬體 Xbar 權重矩陣（{0, 0.5, 1}）
+        J_eval: 評估用的 Ising 矩陣（可選，用於能量計算）
+        epsilon: RPA 比例，控制每個 timestep 更新的 spin 比例 (default: 0.1 = 10%)
+    """
+    N = J_mvm.shape[0]
+    
+    # 1. 初始化為 binary spin {0, 1}
+    b_vector = np.random.choice([0, 1], size=N).astype(np.float64)
+    
+    # 2. 定義退火排程
+    if schedule == 'exponential':
+        alpha = (sigma_end / sigma_start) ** (1.0 / timesteps)
+        annealing_schedule = sigma_start * (alpha ** np.arange(timesteps))
+    else: 
+        annealing_schedule = np.linspace(sigma_start, sigma_end, timesteps)
+    
+    energy_history = []
+    
+    # 記錄初始能量（轉換回 {-1,+1} 計算）
+    if record_energy:
+        s_vector = 2 * b_vector - 1  # {0,1} → {-1,+1}
+        current_energy = calculate_energy(s_vector, J_eval if J_eval is not None else J_mvm)
+        energy_history.append(current_energy)
+    
+    # 3. RPA 同步迴圈
+    for t in range(timesteps):
+        sigma = annealing_schedule[t]
+        
+        # 步驟 1: 真平行 MVM (Crossbar 一次算出所有 I)
+        I_vector = np.dot(J_mvm, b_vector)
+        
+        # 步驟 2: 真平行 TRNG (一次產生共同雜訊)
+        common_noise = np.random.normal(0.0, sigma)
+        noise_vector = np.full(N, common_noise)  # 先假設所有的隨機數都一樣
+        
+        # 步驟 3: 真平行決策 (計算「提議」的新狀態)
+        # Binary 決策（threshold = 0）: 如果 I + noise > 0，則 b = 1；否則 b = 0
+        decision_signal = I_vector + noise_vector
+        b_vector_proposed = (decision_signal > 0).astype(np.float64)  # 經過 sense amplifier 後的結果
+        
+        # === 步驟 4: RPA mask ===
+        # 硬體實現對應：
+        #   - LFSR_1...LFSR_n: 每個 spin 產生一個 uniform [0,1) 隨機數
+        #   - 比較器: 檢查 LFSR_i 是否 < V_rpa (epsilon)
+        #   - 邏輯: LFSR_i < epsilon → 允許更新 spin_i (更新率 = epsilon)
+        #          LFSR_i > epsilon → 不允許更新 spin_i
+        #   - 註：epsilon = 0.1 → 10% 更新率，期望更新 N*0.1 個 spin
+        
+        update_probability = np.random.rand(N)  # LFSR: 為每個 spin 生成 [0,1) 的隨機機率
+        update_mask = update_probability < epsilon  # 比較器: 機率 < epsilon 的 spin 才被允許更新
+        
+        # 最終決策邏輯閘：只更新被允許的 spin，其餘保持原值
+        b_vector_new = np.where(update_mask, b_vector_proposed, b_vector)
+        
+        # 步驟 5: 更新
+        b_vector = b_vector_new
+        
+        # 記錄能量（轉換回 {-1,+1} 計算）
+        if record_energy:
+            s_vector = 2 * b_vector - 1
+            current_energy = calculate_energy(s_vector, J_eval if J_eval is not None else J_mvm)
+            energy_history.append(current_energy)
+    
+    # 返回結果（轉換回 {-1,+1}）
+    s_vector_final = 2 * b_vector - 1
+    
+    if record_energy:
+        return s_vector_final, energy_history
+    else:
+        return s_vector_final, None
+
 def probit_annealing(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
     """
     Probit 類比退火法（非同步更新 - Monte Carlo Sweep）
@@ -374,11 +478,11 @@ def traditional_sa(J_matrix, timesteps, T_start, T_end, schedule='linear', recor
     else:
         return m_vector, None
 
-def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
+def run_comparison_experiment(args, J_mvm, J_eval, G_matrix, best_known):
     """
     執行 Probit vs Traditional SA 的比較實驗
     """
-    N = J_matrix.shape[0]
+    N = J_mvm.shape[0]
     
     print("\n" + "="*80)
     print("開始比較實驗：Probit Annealing vs Traditional SA")
@@ -393,6 +497,7 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         print(f"  → RPA 同步模式（Ratio-Controlled Parallel Annealing - Amorphica 論文）")
         print(f"  → 平行計算：每個 timestep 平行計算所有 {N} 個 I_vector (硬體 Crossbar)")
         print(f"  → 部分更新：每個 timestep 最多更新 {int(N * args.epsilon)} 個 spin (epsilon={args.epsilon})")
+        print(f"  → 硬體 Xbar 權重集合 Jij ∈ {{0, 0.5, 1}}（量化自 G_matrix）")
     else:
         print(f"  → 非同步更新：每個 timestep 更新 {N} 個 spin (MCS)")
     print(f"Traditional SA 參數: T_start={args.T_start}, T_end={args.T_end}")
@@ -421,19 +526,19 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         
         t_start = time.perf_counter()
         if args.probit_mode == 'synchronous':
-            m_probit, energy_hist = probit_fitting_hardware_synchronous( #要使用的演算法，可以更改
-                J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
-                args.schedule, record_energy=record_last, epsilon=args.epsilon
+            m_probit, energy_hist = probit_binary_spin_synchronous(
+                J_mvm, args.timesteps, args.sigma_start, args.sigma_end, 
+                args.schedule, record_energy=record_last, epsilon=args.epsilon, J_eval=J_eval
             )
         else:  # asynchronous
-            m_probit, energy_hist = probit_annealing( # 使用 Monte Carlo
-                J_matrix, args.timesteps, args.sigma_start, args.sigma_end, 
+            m_probit, energy_hist = probit_annealing(
+                J_eval, args.timesteps, args.sigma_start, args.sigma_end, 
                 args.schedule, record_energy=record_last
             )
         t_end = time.perf_counter()
         probit_time = (t_end - t_start) * 1000  # ms
         
-        probit_energy = calculate_energy(m_probit, J_matrix)
+        probit_energy = calculate_energy(m_probit, J_eval)
         probit_cut = calculate_cut(m_probit, G_matrix)
         
         probit_energies.append(probit_energy)
@@ -448,13 +553,13 @@ def run_comparison_experiment(args, J_matrix, G_matrix, best_known):
         # === Traditional SA ===
         t_start = time.perf_counter()
         m_sa, energy_hist_sa = traditional_sa(
-            J_matrix, args.timesteps, args.T_start, args.T_end, 
+            J_eval, args.timesteps, args.T_start, args.T_end, 
             args.schedule, record_energy=record_last
         )
         t_end = time.perf_counter()
         sa_time = (t_end - t_start) * 1000  # ms
         
-        sa_energy = calculate_energy(m_sa, J_matrix)
+        sa_energy = calculate_energy(m_sa, J_eval)
         sa_cut = calculate_cut(m_sa, G_matrix)
         
         sa_energies.append(sa_energy)
@@ -634,10 +739,11 @@ def main():
     
     # 建構矩陣
     G_matrix = get_graph_MAXCUT(vertex, lines)
-    J_matrix = -G_matrix  # For MAXCUT: J = -G
+    J_eval = -G_matrix  # For MAXCUT: J = -G（用於能量/品質評估）
+    J_xbar = quantize_xbar_from_G(G_matrix)  # 硬體 Xbar 權重（{0, 0.5, 1}）
     
     # 執行比較實驗
-    results = run_comparison_experiment(args, J_matrix, G_matrix, best_known)
+    results = run_comparison_experiment(args, J_xbar, J_eval, G_matrix, best_known)
     
     # 儲存結果
     save_results_and_plots(args, results, file_base, best_known)
