@@ -289,6 +289,73 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     else:
         return b_vector, None
 
+def probit_annealing(J_matrix, timesteps, sigma_start, sigma_end, schedule='linear', record_energy=False):
+    """
+    Probit 類比退火法（非同步更新 - Monte Carlo Sweep）
+    
+    每個 timestep 執行 N 次隨機單一 spin 更新
+    """
+    N = J_matrix.shape[0]
+    
+    # 1. 初始化
+    m_vector = np.random.choice([-1, 1], size=N)
+    
+    # 2. 定義退火排程
+    if schedule == 'exponential':
+        alpha = (sigma_end / sigma_start) ** (1.0 / timesteps)
+        annealing_schedule = sigma_start * (alpha ** np.arange(timesteps))
+    else: 
+        annealing_schedule = np.linspace(sigma_start, sigma_end, timesteps)
+    
+    energy_history = []
+    
+    # 如果要記錄能量，我們需要追蹤當前能量以加快速度
+    current_energy = calculate_energy(m_vector, J_matrix)
+    if record_energy:
+        energy_history.append(current_energy)
+    
+    # 3. 非同步 Probit 迴圈 (Monte Carlo Sweep)
+    for t in range(timesteps):
+        sigma = annealing_schedule[t]
+        
+        # 每個 timestep 執行 N 次更新（一個完整的 MCS）
+        for _ in range(N):
+            # 步驟 1: 隨機選擇一個自旋
+            i = np.random.randint(0, N)
+            
+            # 步驟 2: MVM (只計算第 i 個自旋的本地場)
+            # I_i = sum_j(J_ij * m_j)
+            I_i = np.dot(J_matrix[i, :], m_vector)
+            
+            # 步驟 3: TRNG (只取一個雜訊)
+            noise_i = np.random.normal(0.0, sigma)
+            
+            # 步驟 4: 拔河比賽
+            # m_i_new = sgn(I_i + noise_i)
+            new_m_i = np.sign(I_i + noise_i)
+            
+            if new_m_i == 0:
+                new_m_i = 1 # 處理 sgn(0) 的情況
+            
+            # 步驟 5: 立刻更新自旋
+            if m_vector[i] != new_m_i:
+                old_m_i = m_vector[i]
+                m_vector[i] = new_m_i
+                
+                # 更新能量 (使用 Delta E，更有效率)
+                # delta_E_physics = E_new - E_old = -2 * m_i_old * I_i
+                delta_E = 2 * old_m_i * I_i
+                current_energy += delta_E
+        
+        # 每個 MCS 記錄一次能量
+        if record_energy:
+            energy_history.append(current_energy)
+    
+    if record_energy:
+        return m_vector, energy_history
+    else:
+        # 如果不記錄，我們需要返回最終計算的m_vector
+        return m_vector, None
 
 def traditional_sa(J_matrix, timesteps, T_start, T_end, schedule='linear', record_energy=False):
     """
@@ -483,7 +550,9 @@ def save_results_and_plots(args, results, file_base, best_known):
     """儲存結果到 CSV 和圖表"""
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = './multiple_spin_probit_comparison_results'
+    
+    # 檢查是否有環境變數指定輸出目錄（用於批次執行）
+    output_dir = os.environ.get('HARDWARE_OUTPUT_DIR', './multiple_spin_probit_comparison_results')
     os.makedirs(output_dir, exist_ok=True)
     
     mode_suffix = 'sync' if args.probit_mode == 'synchronous' else 'async'
