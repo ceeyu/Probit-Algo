@@ -211,7 +211,7 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     參數:
         epsilon: RPA 比例，控制每個 timestep 更新的 spin 比例 (default: 0.1 = 10%)
     """
-    N = J_matrix.shape[0]
+    N = J_matrix.shape[0] # 如果 J 是一個100*100的矩陣，則J_matrix.shape會回傳(100,100)
     
     # === 硬體矩陣預計算 ===
     # 1. 建立硬體權重矩陣 J_hw
@@ -251,7 +251,7 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
         # (B) 數位修正電路: 還原出理想的本地場 I = J @ s = J @ (2b-1)
         # 推導: I_hw = J_hw @ b = ((J+1)/2) @ b
         #       I = 4*I_hw - 2*J_hw_row_sums - 2*b_sum + N
-        b_sum = np.sum(b_vector)
+        b_sum = np.sum(b_vector) #用硬體參數結果還原比較值
         I_vector = 4.0 * I_hw_vector - 2.0 * J_hw_row_sums - 2.0 * b_sum + N
         
         # 步驟 2: 全局 Gaussian noise（TRNG - 所有 spin 相同）
