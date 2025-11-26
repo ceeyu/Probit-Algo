@@ -91,10 +91,11 @@ def create_output_directories(base_dir='./hardware_comparison_results'):
         └── trial1000_steps10000/
     """
     configs = [
-        ('trial100_steps1000', 100, 1000),
-        ('trial100_steps10000', 100, 10000),
-        ('trial1000_steps100', 1000, 100),
-        ('trial1000_steps10000', 1000, 10000)
+       # ('trial100_steps1000', 100, 1000),
+       # ('trial100_steps10000', 100, 10000),
+       # ('trial1000_steps100', 1000, 100),
+       # ('trial1000_steps10000', 1000, 10000)
+       ('trial1000_steps1000', 1000, 1000) #先測試1000 1000，因為10000跑太久crash
     ]
     
     base_path = Path(base_dir)
