@@ -79,7 +79,7 @@ def get_graph_files(graph_dir, start_idx, end_idx):
     
     return graph_files
 
-def create_output_directories(base_dir='./noise_hardware_comparison_results'):
+def create_output_directories(base_dir='./noise_hardware_comparison_limit_results'):
     """
     創建輸出目錄結構
     
@@ -125,7 +125,7 @@ def run_single_experiment(graph_file, graph_num, trial, timesteps, output_dir, a
     """
     cmd = [
         sys.executable,  # Python 解釋器
-        'hw_noise_probit.py',
+        'hw_noise_probit_limit.py',
         '--file_path', graph_file,
         '--trial', str(trial),
         '--timesteps', str(timesteps),
