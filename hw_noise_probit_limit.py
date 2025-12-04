@@ -215,7 +215,7 @@ def sigma_to_bitmask_k(sigma, sigma_start, sigma_end, n):
         k: bitmask 中 1 的數量
     """
     # 正確映射: k = 2 × sigma²
-    k = int(round(2.0 * sigma * sigma))
+    k = int(round(2.0 * sigma * sigma)) 
     
     # 確保 k 在合理範圍內 [0, n]
     k = max(0, min(n, k))
@@ -388,14 +388,15 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     
     # === Bitmask Generator 監控設定 ===
     # 計算新公式下的 k 範圍 (k = 2 × sigma²)
+    # 讓 k從 2*5*5 到 2*0.01*0.01
     k_start = int(round(2.0 * sigma_start * sigma_start))
     k_end = int(round(2.0 * sigma_end * sigma_end))
     
     # print(f'\n[Bitmask Generator 監控] - 使用正確映射公式 k = 2σ²')
-    # print(f'  n (spin 數量) = {N}')
-    # print(f'  sigma 範圍: {sigma_start} → {sigma_end}')
-    # print(f'  k 範圍 (k = 2σ²): {k_start} → {k_end} (僅需 {k_start} 個 TRNG 通道)')
-    # print(f'  理論 σ_noise 範圍: √({k_start}/2)={np.sqrt(k_start/2):.2f} → √({k_end}/2)={np.sqrt(k_end/2):.2f}')
+    print(f'  n (spin 數量) = {N}')
+    print(f'  sigma 範圍: {sigma_start} → {sigma_end}')
+    print(f'  k 範圍 (k = 2σ²): {k_start} → {k_end} (僅需 {k_start} 個 TRNG 通道)')
+    print(f'  理論 σ_noise 範圍: √({k_start}/2)={np.sqrt(k_start/2):.2f} → √({k_end}/2)={np.sqrt(k_end/2):.2f}')
     
     # 3. RPA 同步迴圈（真平行 + 部分更新）
     for t in range(timesteps):
