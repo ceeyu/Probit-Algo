@@ -6,20 +6,20 @@ import argparse
 from pathlib import Path
 
 """
-批次執行硬體 Probit 類比退火法比較實驗
-=======================================
+批次執行硬體 Probit (Down Counter) vs 傳統 SA 比較實驗
+======================================================
 
 功能：
 1. 對 G1~G81 的所有圖檔執行實驗
-2. 測試 4 種參數組合：
-   - trial=100, timestep=1000
-   - trial=100, timestep=10000
-   - trial=1000, timestep=100
-   - trial=1000, timestep=10000
-3. 結果分別存到 4 個資料夾
+2. Probit 使用 down_counter 排程（硬體 k 線性遞減，σ 呈平方根降溫）
+   對照組為傳統 Metropolis-Hastings 模擬退火（traditional_sa）
+3. 目前啟用的參數組合：
+   - trial=100, timestep=1000（符合論文設定）
+4. 結果存到 ./noise_hardware_comparison_down_counter/
 
 使用方式：
     python batch_hw_noise_comparison.py --graph_dir ./graph --start_graph 1 --end_graph 81
+    python batch_hw_noise_comparison.py --graph_dir ./graph --dry_run   ← 先預覽指令
 """
 
 def parse_arguments():
@@ -38,9 +38,9 @@ def parse_arguments():
                        help="起始溫度 (預設: 5.0)")
     parser.add_argument('--T_end', type=float, default=0.01, 
                        help="結束溫度 (預設: 0.01)")
-    parser.add_argument('--schedule', type=str, default='linear', 
-                       choices=['exponential', 'linear'],
-                       help="退火排程 (預設: linear)")
+    parser.add_argument('--schedule', type=str, default='down_counter', 
+                       choices=['exponential', 'linear', 'down_counter'],
+                       help="退火排程: 'linear'=σ線性, 'exponential'=σ指數, 'down_counter'=硬體k線性遞減 (預設: down_counter)")
     parser.add_argument('--probit_mode', type=str, default='synchronous', 
                        choices=['synchronous', 'asynchronous'],
                        help="Probit 更新模式 (預設: synchronous)")
@@ -79,13 +79,13 @@ def get_graph_files(graph_dir, start_idx, end_idx):
     
     return graph_files
 
-def create_output_directories(base_dir='./noise_hardware_comparison_limit_results'):
+def create_output_directories(base_dir='./noise_hardware_comparison_down_counter'):
     """
     創建輸出目錄結構
-    
+
     結構：
-        noise_hardware_comparison_results/
-        ├── trial100_steps1000/
+        noise_hardware_comparison_down_counter/
+        └── trial100_steps1000/    ← 符合論文設定（trial=100, timesteps=1000）
         ├── trial100_steps10000/
         ├── trial1000_steps100/
         └── trial1000_steps10000/
@@ -170,15 +170,19 @@ def main():
     args = parse_arguments()
     
     print("="*80)
-    print("批次執行硬體 Probit 類比退火法比較實驗")
+    print("批次執行：硬體 Probit (Down Counter) vs 傳統 SA 比較實驗")
     print("="*80)
     print(f"圖檔目錄: {args.graph_dir}")
     print(f"圖檔範圍: G{args.start_graph} ~ G{args.end_graph}")
-    print(f"Probit 模式: {args.probit_mode}")
-    print(f"退火排程: {args.schedule}")
-    print(f"參數: sigma=[{args.sigma_start}, {args.sigma_end}], T=[{args.T_start}, {args.T_end}]")
+    print(f"[Probit]  模式={args.probit_mode}, 排程={args.schedule}")
+    if args.schedule == 'down_counter':
+        k_max = int(round(2.0 * args.sigma_start ** 2))
+        print(f"          → k 線性遞減: {k_max} → 0, σ 呈平方根降溫 ← 論文硬體")
+    else:
+        print(f"          → sigma=[{args.sigma_start}, {args.sigma_end}]")
     if args.probit_mode == 'synchronous':
-        print(f"RPA epsilon: {args.epsilon}")
+        print(f"          RPA epsilon={args.epsilon}")
+    print(f"[SA]      Metropolis-Hastings, T=[{args.T_start}, {args.T_end}]")
     print("="*80 + "\n")
     
     # 取得圖檔列表

@@ -232,8 +232,8 @@ def parse_arguments():
     parser.add_argument('--sigma_end', type=float, default=0.01, help="Ending sigma for Probit (default: 0.01)")
     parser.add_argument('--T_start', type=float, default=5.0, help="Starting temperature for Traditional SA (default: 5.0)")
     parser.add_argument('--T_end', type=float, default=0.01, help="Ending temperature for Traditional SA (default: 0.01)")
-    parser.add_argument('--schedule', type=str, default='linear', choices=['exponential', 'linear'], 
-                       help="Annealing schedule type (default: exponential)")
+    parser.add_argument('--schedule', type=str, default='linear', choices=['exponential', 'linear', 'down_counter'], 
+                       help="Annealing schedule type: 'linear'=σ線性遞減, 'exponential'=σ指數遞減, 'down_counter'=硬體k線性遞減(平方根降溫) (default: linear)")
     parser.add_argument('--probit_mode', type=str, default='synchronous', choices=['synchronous', 'asynchronous'],
                        help="Probit update mode: synchronous (parallel hardware) or asynchronous (MCS) (default: synchronous)")
     parser.add_argument('--epsilon', type=float, default=0.1,
@@ -354,6 +354,13 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     4. 平行決策: b_proposed = (I + noise > 0) ? 1 : 0
     5. RPA 機率遮罩: 使用 LFSR 決定哪些 spin 可以更新
     
+    退火排程模式（schedule 參數）：
+    - 'linear'       : σ 線性遞減（sigma_start → sigma_end），k = 2σ² 為二次曲線
+    - 'exponential'  : σ 指數遞減（sigma_start → sigma_end），k = 2σ² 為指數曲線
+    - 'down_counter' : 硬體 Down Counter，k 線性整數遞減（k_max → 0），
+                       σ(t) = √(k/2) 自動呈平方根降溫，無需浮點運算
+                       此模式最貼近論文硬體電路架構
+    
     參數:
         epsilon: RPA 比例，控制每個 timestep 更新的 spin 比例 (default: 0.1 = 10%)
     """
@@ -373,67 +380,86 @@ def probit_fitting_hardware_synchronous(J_matrix, timesteps, sigma_start, sigma_
     b_vector = np.random.choice([0, 1], size=N).astype(np.float64)
     
     # 2. 定義退火排程
-    if schedule == 'exponential':
+    # k_max = 2σ_start²（三種模式共用此上限值）
+    k_max = int(round(2.0 * sigma_start * sigma_start))
+    k_end_val = int(round(2.0 * sigma_end * sigma_end))
+
+    if schedule == 'down_counter':
+        # === 硬體 Down Counter 模式 ===
+        # k 從 k_max 線性整數遞減至 0，完全對應論文電路中的 Linear Down Counter
+        # σ(t) = √(k(t)/2) 由 k 被動推導，呈平方根降溫曲線
+        # 主控變數為 k（整數），不需要浮點 sigma 排程
+        k_schedule = np.round(np.linspace(k_max, 0, timesteps)).astype(int)
+        annealing_schedule = None  # Down Counter 模式不使用 sigma 排程
+    elif schedule == 'exponential':
+        # σ 指數遞減，k = 2σ² 為指數衰減曲線
         alpha = (sigma_end / sigma_start) ** (1.0 / timesteps)
         annealing_schedule = sigma_start * (alpha ** np.arange(timesteps))
-    else: 
+        k_schedule = None
+    else:  # 'linear'
+        # σ 線性遞減，k = 2σ² 為前快後慢的二次曲線
         annealing_schedule = np.linspace(sigma_start, sigma_end, timesteps)
-    
+        k_schedule = None
+
     energy_history = []
-    
+
     # 記錄初始能量（使用理想的 J_matrix）
     if record_energy:
         current_energy = calculate_energy(b_vector, J_matrix) # b_vector 是 binary spin {0,1}，所以會被calculate_energy轉為{-1,1}
         energy_history.append(current_energy)
-    
-    # === Bitmask Generator 監控設定 ===
-    # 計算新公式下的 k 範圍 (k = 2 × sigma²)
-    # 讓 k從 2*5*5 到 2*0.01*0.01
-    k_start = int(round(2.0 * sigma_start * sigma_start))
-    k_end = int(round(2.0 * sigma_end * sigma_end))
-    
-    # print(f'\n[Bitmask Generator 監控] - 使用正確映射公式 k = 2σ²')
+
+    # === Bitmask Generator 監控輸出 ===
     print(f'  n (spin 數量) = {N}')
     print(f'  sigma 範圍: {sigma_start} → {sigma_end}')
-    print(f'  k 範圍 (k = 2σ²): {k_start} → {k_end} (僅需 {k_start} 個 TRNG 通道)')
-    print(f'  理論 σ_noise 範圍: √({k_start}/2)={np.sqrt(k_start/2):.2f} → √({k_end}/2)={np.sqrt(k_end/2):.2f}')
+    if schedule == 'down_counter':
+        print(f'  [Down Counter 模式] k 線性整數遞減: {k_max} → 0')
+        print(f'  σ 為平方根降溫: {np.sqrt(k_max/2):.2f} → 0.00（由 k 被動推導）')
+        print(f'  控制電路：整數計數器，無需浮點運算 ← 最貼近硬體')
+    else:
+        print(f'  [{schedule} 模式] σ 主控，k = 2σ²')
+        print(f'  k 範圍: {k_max} → {k_end_val} (僅需 {k_max} 個 TRNG 通道)')
+        print(f'  理論 σ_noise 範圍: √({k_max}/2)={np.sqrt(k_max/2):.2f} → √({k_end_val}/2)={np.sqrt(k_end_val/2):.2f}')
     
     # 3. RPA 同步迴圈（真平行 + 部分更新）
     for t in range(timesteps):
-        sigma = annealing_schedule[t]
-        
+
+        # === 退火排程：依模式取得當前 k 與 sigma ===
+        if schedule == 'down_counter':
+            # Down Counter 模式：k 直接從整數陣列取值（對應硬體計數器）
+            # 硬體只需要整數 k，不需要浮點 sigma
+            # σ 在此模式下不是控制變數，後續步驟全部只用 k
+            k = int(k_schedule[t])
+        else:
+            # linear / exponential 模式：σ 為主控，k = 2σ² 轉換
+            sigma = annealing_schedule[t]
+            k = sigma_to_bitmask_k(sigma, sigma_start, sigma_end, N)
+
         # === 步驟 1: 真平行 MVM（硬體 Crossbar 類比計算 + 數位修正）===
         # (A) 硬體 Crossbar MVM: J_hw {0, 0.5, 1} @ b {0, 1}
         I_hw_vector = np.dot(J_hw_matrix, b_vector)
-        
+
         # (B) 數位修正電路: 還原出理想的本地場 I = J @ s = J @ (2b-1)
         # 推導: I_hw = J_hw @ b = ((J+1)/2) @ b
         #       I = 4*I_hw - 2*J_hw_row_sums - 2*b_sum + N
         b_sum = np.sum(b_vector) #用硬體參數結果還原比較值
         I_vector = 4.0 * I_hw_vector - 2.0 * J_hw_row_sums - 2.0 * b_sum + N
-        
+
         # === 步驟 2: 硬體雜訊產生（Bitmask + MUX + TRNG + All-1 Xbar）===
-        # 硬體架構：
-        #   - Bitmask Generator: 根據當前溫度(sigma)產生遮罩
-        #   - 2k 個 MUX 啟用: 前 k 個 (1→TRNG)，後 k 個 (1→TRNG)
-        #   - 2k 個類比 TRNG: 產生 {0, 1}
-        #   - All-1 Xbar: 將所有輸出加總
-        #   - 數位修正: noise = total - N (使均值為 0)
-        #
-        # 正確映射公式: k = 2 × sigma²
-        # 這樣 σ_hw = √(k/2) = √(2σ²/2) = σ（與軟體匹配！）
-        
-        k = sigma_to_bitmask_k(sigma, sigma_start, sigma_end, N)
+        # 三種模式在此匯合，共用相同的硬體雜訊電路
+        # k 已在排程區塊決定，直接傳入產生器
         common_noise = hardware_bitmask_noise_generator(N, k)
         noise_vector = np.full(N, float(common_noise))
         '''
         # === Bitmask Generator 監控輸出（每個 timestep 都輸出）===
+        # 注意：down_counter 模式下 sigma 未被計算，如需顯示請先補算：
+        #   sigma_display = np.sqrt(k / 2.0) if k > 0 else 0.0
         # 產生完整 bitmask
         full_bitmask = '1' * k + '0' * (N - k)
         sigma_theory = np.sqrt(k / 2) if k > 0 else 0
-        
+        sigma_display = sigma if schedule != 'down_counter' else sigma_theory
+
         print(f'\n{"="*80}')
-        print(f'Timestep: {t} | sigma: {sigma:.4f} | k: {k} | k/n: {k/N:.2%} | noise: {common_noise} | σ_theory: {sigma_theory:.2f}')
+        print(f'Timestep: {t} | sigma: {sigma_display:.4f} | k: {k} | k/n: {k/N:.2%} | noise: {common_noise} | σ_theory: {sigma_theory:.2f}')
         print(f'{"="*80}')
         print(f'完整 Bitmask (n={N}, k={k}個1):')
         
