@@ -91,11 +91,8 @@ def create_output_directories(base_dir='./noise_hardware_comparison_down_counter
         └── trial1000_steps10000/
     """
     configs = [
-       ('trial100_steps1000', 100, 1000),
-       # ('trial100_steps10000', 100, 10000),
-       # ('trial1000_steps100', 1000, 100),
-       # ('trial1000_steps10000', 1000, 10000)
-       # ('trial1000_steps1000', 1000, 1000) #先測試1000 1000，因為10000跑太久crash
+       ('trial1000_steps1000', 1000, 1000),
+       ('trial100_steps10000', 100, 10000),
     ]
     
     base_path = Path(base_dir)
@@ -153,6 +150,7 @@ def run_single_experiment(graph_file, graph_num, trial, timesteps, output_dir, a
         # 設置環境變數，讓子程序知道輸出目錄
         env = os.environ.copy()
         env['HARDWARE_OUTPUT_DIR'] = output_dir
+        env['PYTHONUNBUFFERED'] = '1'  # 讓子程序也 unbuffered
         
         result = subprocess.run(cmd, check=True, capture_output=False, text=True, env=env)
         print(f"✓ 完成: G{graph_num} | Trial={trial}, Timesteps={timesteps}")
